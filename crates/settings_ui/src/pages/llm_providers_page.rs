@@ -1138,6 +1138,7 @@ fn save_llm_provider_form(
                                         api_url: api_url.clone(),
                                         available_models,
                                         custom_headers: None,
+                                        auto_discover: None,
                                     },
                                 );
                         }

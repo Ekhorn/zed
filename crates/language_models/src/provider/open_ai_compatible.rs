@@ -1,8 +1,8 @@
 use anyhow::Result;
 use credentials_provider::CredentialsProvider;
-use futures::{FutureExt, StreamExt, future::BoxFuture};
-use gpui::{App, AppContext, AsyncApp, Entity, Task};
-use http_client::{CustomHeaders, HttpClient};
+use futures::{AsyncReadExt, FutureExt, StreamExt, future::BoxFuture};
+use gpui::{App, AppContext, AsyncApp, Context, Entity, Subscription, Task};
+use http_client::{AsyncBody, CustomHeaders, HttpClient, Method, RequestBuilderExt};
 use language_model::chat_completion::ChatCompletionEventMapper;
 use language_model::{
     AuthenticateError, IconOrSvg, LanguageModel, LanguageModelClient, LanguageModelCompletionError,
@@ -20,6 +20,7 @@ use open_ai::{
 use settings::Settings;
 use std::sync::Arc;
 use ui::IconName;
+use util::ResultExt as _;
 
 use crate::provider::api_compatible::{
     ApiCompatibleProviderConfigurationView, ApiCompatibleProviderSettings,
@@ -31,11 +32,16 @@ pub use settings::OpenAiCompatibleModelCapabilities as ModelCapabilities;
 
 const API_KEY_PLACEHOLDER: &str = "000000000000000000000000000000000000000000000000000";
 
+/// The OpenAI `/models` endpoint doesn't report context sizes, so discovered
+/// models without a vendor-specific hint assume a common default.
+const DISCOVERED_MODEL_DEFAULT_MAX_TOKENS: u64 = 128_000;
+
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct OpenAiCompatibleSettings {
     pub api_url: String,
     pub available_models: Vec<AvailableModel>,
     pub custom_headers: CustomHeaders,
+    pub auto_discover: bool,
 }
 
 impl ApiCompatibleProviderSettings for OpenAiCompatibleSettings {
@@ -51,6 +57,7 @@ pub struct OpenAiCompatibleLanguageModelProvider {
     name: LanguageModelProviderName,
     http_client: Arc<dyn HttpClient>,
     state: Entity<State>,
+    model_discovery: Entity<ModelDiscovery>,
     request_limiters: ModelRateLimiters,
 }
 
@@ -71,19 +78,38 @@ impl OpenAiCompatibleLanguageModelProvider {
             },
             cx,
         );
+        let model_discovery =
+            cx.new(|cx| ModelDiscovery::new(state.clone(), http_client.clone(), cx));
 
         Self {
             id: id.clone().into(),
             name: id.into(),
             http_client,
             state,
+            model_discovery,
             request_limiters: ModelRateLimiters::default(),
         }
     }
 
-    /// Every model this provider offers, in settings order.
-    fn available_models<'a>(&self, cx: &'a App) -> &'a [AvailableModel] {
-        &self.state.read(cx).settings.available_models
+    /// Every model this provider offers: the configured models in settings
+    /// order, followed by discovered models that aren't configured.
+    fn available_models(&self, cx: &App) -> Vec<AvailableModel> {
+        let configured_models = &self.state.read(cx).settings.available_models;
+        let discovered_models = self
+            .model_discovery
+            .read(cx)
+            .models
+            .iter()
+            .filter(|discovered| {
+                !configured_models
+                    .iter()
+                    .any(|configured| configured.name == discovered.name)
+            });
+        configured_models
+            .iter()
+            .chain(discovered_models)
+            .cloned()
+            .collect()
     }
 
     fn language_model(&self, model: &AvailableModel) -> LanguageModel {
@@ -123,9 +149,8 @@ impl OpenAiCompatibleLanguageModelProvider {
         cx: &App,
     ) -> Result<AvailableModel, LanguageModelCompletionError> {
         self.available_models(cx)
-            .iter()
+            .into_iter()
             .find(|available| available.name == model.id.0.as_ref())
-            .cloned()
             .ok_or_else(|| unavailable_error(model))
     }
 
@@ -264,6 +289,8 @@ impl LanguageModelProvider for OpenAiCompatibleLanguageModelProvider {
     }
 
     fn authenticate(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>> {
+        self.model_discovery
+            .update(cx, |discovery, cx| discovery.retry_failed_fetch(cx));
         self.state.update(cx, |state, cx| state.authenticate(cx))
     }
 
@@ -363,6 +390,151 @@ impl LanguageModelClient for OpenAiCompatibleLanguageModelProvider {
     }
 }
 
+/// Models listed by the provider's `/models` endpoint.
+///
+/// Changes to `models` are announced by notifying `State`, since that is the
+/// provider's observable entity.
+struct ModelDiscovery {
+    state: Entity<State>,
+    http_client: Arc<dyn HttpClient>,
+    models: Vec<AvailableModel>,
+    /// The endpoint `models` were fetched (or are being fetched) from.
+    fetched_from: Option<DiscoveryEndpoint>,
+    fetch_failed: bool,
+    fetch_task: Option<Task<()>>,
+    _state_subscription: Subscription,
+}
+
+#[derive(Clone, PartialEq)]
+struct DiscoveryEndpoint {
+    api_url: String,
+    api_key: Arc<str>,
+    custom_headers: CustomHeaders,
+}
+
+impl ModelDiscovery {
+    fn new(state: Entity<State>, http_client: Arc<dyn HttpClient>, cx: &mut Context<Self>) -> Self {
+        let state_subscription = cx.observe(&state, |this, _, cx| this.refresh(cx));
+        let mut this = Self {
+            state,
+            http_client,
+            models: Vec::new(),
+            fetched_from: None,
+            fetch_failed: false,
+            fetch_task: None,
+            _state_subscription: state_subscription,
+        };
+        this.refresh(cx);
+        this
+    }
+
+    /// Fetches again after a failure, e.g. when the server wasn't running yet.
+    fn retry_failed_fetch(&mut self, cx: &mut Context<Self>) {
+        if self.fetch_failed {
+            self.fetched_from = None;
+            self.refresh(cx);
+        }
+    }
+
+    /// Fetches models if discovery is enabled and the endpoint changed since the last fetch.
+    fn refresh(&mut self, cx: &mut Context<Self>) {
+        let endpoint = {
+            let state = self.state.read(cx);
+            let settings = &state.settings;
+            settings
+                .auto_discover
+                .then(|| state.api_key_state.key(&settings.api_url))
+                .flatten()
+                .map(|api_key| DiscoveryEndpoint {
+                    api_url: settings.api_url.clone(),
+                    api_key,
+                    custom_headers: settings.custom_headers.clone(),
+                })
+        };
+        if endpoint == self.fetched_from {
+            return;
+        }
+        self.fetched_from = endpoint.clone();
+        self.fetch_failed = false;
+        let Some(endpoint) = endpoint else {
+            self.models.clear();
+            self.fetch_task = None;
+            self.state.update(cx, |_, cx| cx.notify());
+            return;
+        };
+
+        let http_client = self.http_client.clone();
+        self.fetch_task = Some(cx.spawn(async move |this, cx| {
+            let result = fetch_models(http_client.as_ref(), &endpoint).await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(models) => this.models = models,
+                    Err(error) => {
+                        log::error!(
+                            "Failed to discover models from {}: {error:#}",
+                            endpoint.api_url
+                        );
+                        this.models.clear();
+                        this.fetch_failed = true;
+                    }
+                }
+                this.state.update(cx, |_, cx| cx.notify());
+            })
+            .log_err();
+        }));
+    }
+}
+
+async fn fetch_models(
+    http_client: &dyn HttpClient,
+    endpoint: &DiscoveryEndpoint,
+) -> Result<Vec<AvailableModel>> {
+    let request = http_client::Request::builder()
+        .method(Method::GET)
+        .uri(format!("{}/models", endpoint.api_url))
+        .header("Accept", "application/json")
+        .header("Authorization", format!("Bearer {}", endpoint.api_key))
+        .extra_headers(&endpoint.custom_headers)
+        .body(AsyncBody::default())?;
+    let mut response = http_client.send(request).await?;
+    let mut body = String::new();
+    response.body_mut().read_to_string(&mut body).await?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "status {}: {body}",
+        response.status()
+    );
+
+    // Entries are read leniently, since compatible servers vary in what else they report.
+    let response: serde_json::Value = serde_json::from_str(&body)?;
+    let entries = response
+        .get("data")
+        .and_then(|data| data.as_array())
+        .ok_or_else(|| anyhow::anyhow!("response has no `data` array"))?;
+    Ok(entries
+        .iter()
+        .filter_map(|entry| {
+            let name = entry.get("id")?.as_str()?.to_string();
+            // Not part of the OpenAI API, but reported by servers such as
+            // OpenRouter and Together (`context_length`), Groq
+            // (`context_window`), and vLLM (`max_model_len`).
+            let max_tokens = ["context_length", "context_window", "max_model_len"]
+                .iter()
+                .find_map(|key| entry.get(*key)?.as_u64())
+                .unwrap_or(DISCOVERED_MODEL_DEFAULT_MAX_TOKENS);
+            Some(AvailableModel {
+                name,
+                display_name: None,
+                max_tokens,
+                max_output_tokens: None,
+                max_completion_tokens: None,
+                reasoning_effort: None,
+                capabilities: ModelCapabilities::default(),
+            })
+        })
+        .collect())
+}
+
 fn default_thinking_reasoning_effort(model: &AvailableModel) -> Option<open_ai::ReasoningEffort> {
     model
         .reasoning_effort
@@ -456,6 +628,52 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    #[gpui::test]
+    async fn fetch_models_reads_ids_and_context_hints() {
+        let http_client = http_client::FakeHttpClient::create(|request| async move {
+            assert_eq!(request.uri().path(), "/v1/models");
+            assert_eq!(
+                request
+                    .headers()
+                    .get("Authorization")
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer test-key")
+            );
+            let body = json!({
+                "object": "list",
+                "data": [
+                    { "id": "plain-model", "object": "model" },
+                    { "id": "vllm-model", "max_model_len": 32768 },
+                    { "id": "groq-model", "context_window": 131072 },
+                    { "object": "model" }
+                ]
+            });
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(AsyncBody::from(body.to_string()))?)
+        });
+        let endpoint = DiscoveryEndpoint {
+            api_url: "https://example.com/v1".to_string(),
+            api_key: "test-key".into(),
+            custom_headers: CustomHeaders::default(),
+        };
+
+        let models = fetch_models(http_client.as_ref(), &endpoint).await.unwrap();
+
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| (model.name.as_str(), model.max_tokens))
+                .collect::<Vec<_>>(),
+            [
+                ("plain-model", DISCOVERED_MODEL_DEFAULT_MAX_TOKENS),
+                ("vllm-model", 32768),
+                ("groq-model", 131072),
+            ]
+        );
+        assert_eq!(models[0].capabilities, ModelCapabilities::default());
     }
 
     #[test]

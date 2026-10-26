@@ -423,8 +423,14 @@ impl MergeFrom for OpenAiReasoningEffort {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, JsonSchema, MergeFrom)]
 pub struct OpenAiCompatibleSettingsContent {
     pub api_url: String,
+    #[serde(default)]
     pub available_models: Vec<OpenAiCompatibleAvailableModel>,
     pub custom_headers: Option<HashMap<String, String>>,
+    /// Whether to also offer the models listed by the provider's `/models` endpoint.
+    /// Entries in `available_models` take precedence over discovered models of the same name.
+    ///
+    /// Default: true
+    pub auto_discover: Option<bool>,
 }
 
 #[with_fallible_options]
